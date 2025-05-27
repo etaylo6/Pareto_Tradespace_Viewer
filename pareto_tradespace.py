@@ -9,9 +9,9 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import venn
 
-# Pareto mask
-
+# Pareto mask function
 def pareto_mask(data: np.ndarray) -> np.ndarray:
     is_pareto = np.ones(data.shape[0], dtype=bool)
     for i, row in enumerate(data):
@@ -21,12 +21,6 @@ def pareto_mask(data: np.ndarray) -> np.ndarray:
             if np.any(dominates):
                 is_pareto[i] = False
     return is_pareto
-
-# Ensure venn module is importable
-script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
-import venn
 
 class DataVisualizer(QMainWindow):
     def __init__(self):
@@ -82,9 +76,18 @@ class DataVisualizer(QMainWindow):
         self.details.setReadOnly(True)
         ctrl_layout.addWidget(self.details, stretch=1)
 
-        # Events
+        # Connect events
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('pick_event', self.on_pick)
+
+    def show_details(self, idx: int):
+        row = self.data.iloc[idx]
+        html = ['<table>']
+        for col, val in row.items():
+            v = f"{val:.3f}" if isinstance(val, float) else str(val)
+            html.append(f'<tr><td><b>{col}</b></td><td>{v}</td></tr>')
+        html.append('</table>')
+        self.details.setHtml('\n'.join(html))
 
     def load_data(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
@@ -93,20 +96,19 @@ class DataVisualizer(QMainWindow):
         self.data = pd.read_csv(path)
         numeric = self.data.select_dtypes(include=[np.number])
         self.numeric_cols = list(numeric.columns)
-        if self.numeric_cols:
-            self.pareto = pareto_mask(numeric.values)
-        else:
-            self.pareto = np.zeros(len(self.data), dtype=bool)
+        self.pareto = pareto_mask(numeric.values) if self.numeric_cols else np.zeros(len(self.data), dtype=bool)
 
         cols = list(self.data.columns)
         self.x_combo.clear(); self.x_combo.addItems(cols)
         self.y_combo.clear(); self.y_combo.addItems(cols)
         if cols: self.x_combo.setCurrentIndex(0)
-        if len(cols)>1: self.y_combo.setCurrentIndex(1)
+        if len(cols) > 1: self.y_combo.setCurrentIndex(1)
 
+        # Enable Venn only for 2–6 numeric dims
         ven_item = self.mode_combo.model().item(1)
-        ven_item.setEnabled(2<=len(self.numeric_cols)<=6)
-        if not ven_item.isEnabled(): self.mode_combo.setCurrentIndex(0)
+        ven_item.setEnabled(2 <= len(self.numeric_cols) <= 6)
+        if not ven_item.isEnabled():
+            self.mode_combo.setCurrentIndex(0)
 
         self.update_plot()
 
@@ -114,73 +116,122 @@ class DataVisualizer(QMainWindow):
         if self.data is None:
             return
         mode = self.mode_combo.currentText()
-        # Venn mode
-        if mode=="Venn Diagram" and 2<=len(self.numeric_cols)<=6:
+
+        # --- Venn Diagram Mode ---
+        if mode == "Venn Diagram" and 2 <= len(self.numeric_cols) <= 6:
             self.figure.clear()
             ax = self.figure.add_subplot(111)
-            numeric = self.data[self.numeric_cols]
-            arr = numeric.values
-            pareto_arr = arr[self.pareto]
-            max_by_dim = pareto_arr.max(axis=0)
-            sets_list = [set(np.where(self.pareto & (arr[:,j]==max_by_dim[j]))[0])
-                         for j in range(len(self.numeric_cols))]
-            labels = venn.get_labels(sets_list, fill=["number","logic"])
-            func = getattr(venn, f"venn{len(self.numeric_cols)}")
-            func(labels, names=self.numeric_cols, ax=ax)
+            arr = self.data[self.numeric_cols].values
+            D = arr.shape[1]
 
+            # Compute subspace-Pareto sets (exclude each dim)
+            subfronts = []
+            for j in range(D):
+                subdims = [k for k in range(D) if k != j]
+                mask = pareto_mask(arr[:, subdims])
+                subfronts.append(set(np.where(mask)[0]))
+
+            # All Pareto-optimal indices
+            pareto_idx = np.where(self.pareto)[0]
+
+            # Region dictionary: bitkey -> indices
+            region_dict = {}
+            # For each point, build inverted bitkey: 1 = excels in dim j
+            for idx in pareto_idx:
+                bitkey = ''.join(
+                    '1' if idx not in subfronts[j] else '0'
+                    for j in range(D)
+                )
+                region_dict.setdefault(bitkey, []).append(idx)
+
+            # Blank interior labels and draw Venn
+            labels = venn.get_labels([region_dict.get(k, []) for k in sorted(region_dict)], fill=["number","logic"])
+            labels = {k: '' for k in labels}
+            getattr(venn, f"venn{D}")(labels, names=self.numeric_cols, ax=ax)
+
+            # Style set titles
+            for txt in ax.texts:
+                if txt.get_text() in self.numeric_cols:
+                    txt.set_color('black')
+                    x, y = txt.get_position()
+                    txt.set_position((x, y + 0.05))
+
+            # Precompute polar mapping
+            pareto_arr = arr[pareto_idx]
+            global_max = pareto_arr.max(axis=0)
+            norm_factor = np.linalg.norm(global_max)
+            angles = np.linspace(0, 2*np.pi, D, endpoint=False)
+            max_r = 0.15
+
+            # Hard-coded region centers
             region_centers = {
-                2:{"10":(0.26,0.30),"01":(0.74,0.30),"11":(0.50,0.30)},
-                3:{"001":(0.50,0.27),"010":(0.73,0.65),"011":(0.61,0.46),
-                   "100":(0.27,0.65),"101":(0.39,0.46),"110":(0.50,0.65),"111":(0.50,0.51)}
-            }
-            centers = region_centers[len(self.numeric_cols)]
+                2: {'10': (0.26,0.30), '01': (0.74,0.30), '11': (0.50,0.30)},
+                3: {'001': (0.50,0.27), '010': (0.73,0.65), '011': (0.61,0.46),
+                     '100': (0.27,0.65), '101': (0.39,0.46), '110': (0.50,0.65), '111': (0.50,0.51)}
+            }[D]
+
             xs, ys, self.venn_indices = [], [], []
-            for idx in np.where(self.pareto)[0]:
-                key="".join("1" if arr[idx,j]==max_by_dim[j] else "0"
-                              for j in range(len(self.numeric_cols)))
-                if key in centers:
-                    x0,y0 = centers[key]
-                    dx,dy = (np.random.rand(2)-0.5)*0.05
-                    xs.append(x0+dx); ys.append(y0+dy)
+            # Place each point in its region
+            for key, indices in region_dict.items():
+                if key not in region_centers:
+                    # fallback to full front
+                    key = max(region_centers.keys(), key=lambda k: k.count('1'))
+                x0, y0 = region_centers[key]
+                for idx in indices:
+                    perf = arr[idx]
+                    # radius = distance from Pareto ideal
+                    r = max_r * (np.linalg.norm(global_max - perf) / norm_factor)
+                    # angle = weighted by performance
+                    perf_norm = perf / global_max
+                    vec = np.array([np.sum(perf_norm * np.cos(angles)),
+                                    np.sum(perf_norm * np.sin(angles))])
+                    theta = np.arctan2(vec[1], vec[0])
+                    xs.append(x0 + r*np.cos(theta))
+                    ys.append(y0 + r*np.sin(theta))
                     self.venn_indices.append(idx)
+
             self.venn_scatter = ax.scatter(xs, ys, color='black', s=30, picker=5)
             self.canvas.draw()
             return
-        # Scatter mode
-        if self.canvas.figure is not self.figure:
-            self.canvas.figure = self.figure
+
+        # --- Scatter Plot Mode ---
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         x_col = self.x_combo.currentText(); y_col = self.y_combo.currentText()
         if x_col and y_col:
-            x=self.data[x_col]; y=self.data[y_col]
+            x = self.data[x_col]; y = self.data[y_col]
             ax.scatter(x[~self.pareto], y[~self.pareto], picker=True)
             ax.scatter(x[self.pareto], y[self.pareto], picker=True, color='red')
             ax.set_xlabel(x_col); ax.set_ylabel(y_col)
         self.canvas.draw()
 
     def on_click(self, event):
-        if self.data is None or event.xdata is None: return
-        mode=self.mode_combo.currentText(); xdata,ydata=event.xdata,event.ydata
-        if mode=="Scatter Plot":
-            x_col,y_col=self.x_combo.currentText(),self.y_combo.currentText()
-            df=self.data[[x_col,y_col]].dropna(); pts=df.values
-            d=np.sum((pts-[xdata,ydata])**2,axis=1); i=d.argmin();
-            self.details.setText(self.data.iloc[i].to_string())
+        if self.data is None or event.xdata is None:
+            return
+        mode = self.mode_combo.currentText()
+        xdata, ydata = event.xdata, event.ydata
+        if mode == "Scatter Plot":
+            pts = self.data[[self.x_combo.currentText(), self.y_combo.currentText()]].dropna().values
+            d = np.sum((pts - [xdata, ydata])**2, axis=1)
+            i = d.argmin()
+            self.show_details(i)
         else:
-            coords=np.array(list(zip(*self.venn_scatter.get_offsets().T))).T if False else np.array(self.venn_scatter.get_offsets())
-            d=np.sum((coords-[xdata,ydata])**2,axis=1); i=d.argmin()
-            if d[i]<0.02:
-                self.details.setText(self.data.iloc[self.venn_indices[i]].to_string())
+            coords = np.array(self.venn_scatter.get_offsets())
+            d = np.sum((coords - [xdata, ydata])**2, axis=1)
+            i = d.argmin()
+            if d[i] < 0.02:
+                self.show_details(self.venn_indices[i])
 
     def on_pick(self, event):
-        if self.data is None or self.mode_combo.currentText()!="Venn Diagram": return
-        if event.artist!=self.venn_scatter: return
-        i=event.ind[0]
-        self.details.setText(self.data.iloc[self.venn_indices[i]].to_string())
+        if self.data is None or self.mode_combo.currentText() != "Venn Diagram":
+            return
+        if event.artist is not self.venn_scatter:
+            return
+        i = event.ind[0]
+        self.show_details(self.venn_indices[i])
 
-if __name__=='__main__':
-    app=QApplication(sys.argv)
-    viz=DataVisualizer()
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    viz = DataVisualizer()
     viz.show()
     sys.exit(app.exec_())
